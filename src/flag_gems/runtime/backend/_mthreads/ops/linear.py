@@ -30,6 +30,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from flag_gems.ops.linear import linear as default_linear
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
 
 # Reuse the warp-specialized GEMM building blocks.  linear is the same GEMM as
 # addmm, but the weight stays in its native [N, K] layout: the consumer asks
@@ -45,6 +46,8 @@ from .mm import (  # noqa: E402
     _WS_STAGES,
     TLE_WS_ON,
     _ws_rasterization_2d_column,
+    mm_splitk_kernel,
+    mm_splitk_reduce_kernel,
 )
 
 try:
@@ -80,6 +83,7 @@ def _linear_kernel(
     FP32_INPUT: tl.constexpr,
     USE_TF32: tl.constexpr,
     X_CG: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -127,11 +131,12 @@ def _linear_kernel(
         x_ptrs += BLOCK_K * stride_xk
         w_ptrs += BLOCK_K * stride_wk
 
-    if EVEN_N:
-        bias = tl.load(b_ptr + offs_n)
-    else:
-        bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
-    acc = acc + bias[None, :]
+    if HAS_BIAS:
+        if EVEN_N:
+            bias = tl.load(b_ptr + offs_n)
+        else:
+            bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc = acc + bias[None, :]
 
     y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
     if EVEN_M and EVEN_N:
@@ -404,6 +409,69 @@ def _linear_sqmma_ws(x, weight, bias, y, M, N, K):
         )
 
 
+def _linear_splitk_config(M, N, K):
+    # Experimental family-level policy. Avoid splitting short reductions and
+    # cap scratch size; all thresholds must pass the broad validation suite.
+    if not (0 < M <= 32 and N > 1 and 2048 <= K <= 32768):
+        return None
+    base_ctas = triton.cdiv(M, 32) * triton.cdiv(N, 32)
+    # Splitting a nearly saturated output grid adds partial/reduction traffic.
+    # Require enough K work relative to output size before paying that cost.
+    # These conservative S5000 family thresholds are validated separately.
+    if base_ctas > 256 or K < M * base_ctas:
+        return None
+    parallel_limit = triton.cdiv(2048, base_ctas)
+    work_limit = K // 512
+    memory_limit = (8 * 1024 * 1024) // (4 * M * N)
+    limit = min(16, parallel_limit, work_limit, memory_limit)
+    split_k = 1
+    while split_k * 2 <= limit:
+        split_k *= 2
+    return (split_k, 64) if split_k >= 2 else None
+
+
+@libentry()
+@triton.jit
+def _linear_splitk_bias_reduce_kernel(
+    partial, bias, output,
+    M: tl.constexpr, N: tl.constexpr, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    parts = tl.arange(0, SPLIT_K)
+    mask = offsets < M * N
+    values = tl.load(
+        partial + parts[:, None] * M * N + offsets[None, :],
+        mask[None, :], other=0.0,
+    )
+    # Accumulate partials in FP32 and add the vector bias exactly once,
+    # before conversion to the output dtype. No extra elementwise launch.
+    result = tl.sum(values, axis=0)
+    b = tl.load(bias + offsets % N, mask, other=0.0).to(tl.float32)
+    tl.store(output + offsets, result + b, mask)
+
+
+def _linear_splitk(x, weight, M, N, K, split_k, block_k, bias=None):
+    logger.debug("GEMS_MTHREADS LINEAR_SPLITK")
+    y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    partial = torch.empty((split_k, M, N), device=x.device, dtype=torch.float32)
+    with torch_device_fn.device(x.device):
+        mm_splitk_kernel[(triton.cdiv(M, 32), triton.cdiv(N, 32), split_k)](
+            x, weight, partial, M, N, K,
+            x.stride(0), x.stride(1), weight.stride(1), weight.stride(0),
+            BLOCK_M=32, BLOCK_N=32, BLOCK_K=block_k, SPLIT_K=split_k,
+            num_warps=4, num_stages=1,
+        )
+        if bias is None:
+            mm_splitk_reduce_kernel[(triton.cdiv(M * N, 256),)](
+                partial, y, M * N, split_k, BLOCK=256, num_warps=4,
+            )
+        else:
+            _linear_splitk_bias_reduce_kernel[(triton.cdiv(M * N, 256),)](
+                partial, bias, y, M, N, split_k, BLOCK=256, num_warps=4,
+            )
+    return y
+
+
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
 
@@ -428,6 +496,28 @@ def linear(input, weight, bias=None):
         x = x.reshape(-1, x.shape[-1])
     M, K = x.shape
     N = weight.shape[0]
+
+    if (
+        input.dtype in (torch.float16, torch.bfloat16)
+        # Bias already fits in the original one-kernel epilogue. Require
+        # enough reduction work to amortize Split-K's second launch in eager.
+        and (bias is None or K >= 8192)
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        split_config = _linear_splitk_config(M, N, K)
+        if split_config is not None and (
+            bias is None
+            or (
+                bias.ndim == 1
+                and bias.numel() == N
+                and bias.dtype == input.dtype
+                and bias.device == input.device
+                and bias.is_contiguous()
+            )
+        ):
+            y = _linear_splitk(x, weight, M, N, K, *split_config, bias=bias)
+            return y.reshape(in_shape[:-1] + (N,))
 
     # Warp-specialized SQMMA fast path.  Keeping the weight in [N, K] layout
     # and using wgmma's trans_b operand avoids the per-call transpose copy.
@@ -473,10 +563,9 @@ def linear(input, weight, bias=None):
     else:
         y = out
 
-    if bias is None:
-        b = torch.zeros(N, device=input.device, dtype=input.dtype)
-    else:
-        b = bias
+    has_bias = bias is not None
+    # The no-bias specialization never dereferences this placeholder pointer.
+    b = bias if has_bias else y
 
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     _linear_kernel[grid](
@@ -503,6 +592,7 @@ def linear(input, weight, bias=None):
         FP32_INPUT=(input.dtype == torch.float32),
         USE_TF32=use_tf32,
         X_CG=xcg,
+        HAS_BIAS=has_bias,
         num_warps=nw,
         num_stages=ns,
     )
